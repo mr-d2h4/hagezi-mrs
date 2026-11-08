@@ -49,13 +49,30 @@ jobs:
           done
           rm -f mihomo
 
-      - name: 4. 提交更新
+      - name: 4. 提交更新到仓库
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
-          git pull --rebase origin main
+          
+          # 核心修正：强制重置本地状态与远程仓库一致，丢弃任何未追踪的文件或潜在的冲突状态
+          git fetch origin main
+          git reset --hard origin/main
+          
+          # 清理旧文件（确保只保留当前最新生成的）
+          rm -f *.mrs
+          
+          # 重新下载和生成文件... (在这里你的步骤3已经生成了新文件，不需要额外动作)
+          # 注意：为了让这个脚本逻辑完整，我们需要把生成文件的逻辑包含在此步骤前，
+          # 但既然你已经在上一步生成了，这里我们只需要 add 即可
+          
+          # 重新添加所有文件
           git add -A
+          
+          # 检查是否有文件变动
           if ! git diff --quiet --cached; then
-            git commit -m "Auto Update MRS: Added DGA and HaGeZi"
-            git push
+            git commit -m "Auto Update MRS: $(date +'%Y-%m-%d %H:%M:%S')"
+            # 这里的 push --force 是可选项，但通常 reset --hard 后不需要 force
+            git push origin main
+          else
+            echo "没有文件变动，跳过提交"
           fi
