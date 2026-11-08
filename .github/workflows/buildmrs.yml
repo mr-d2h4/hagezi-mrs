@@ -2,7 +2,7 @@ name: Build All-in-One MRS
 
 on:
   schedule:
-    - cron: '0 20 * * *'
+    - cron: '0 20 * * *' # 每天北京时间凌晨 4:00 自动运行
   workflow_dispatch:
 
 permissions:
@@ -15,8 +15,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 1. 下载 Mihomo 内核
+      - name: 1. 清理旧文件并下载 Mihomo 内核
         run: |
+          # 先删掉仓库里所有旧的 .mrs 文件（包括残留的 allow 或 spam）
+          rm -f *.mrs
+          
+          # 下载最新内核
           LATEST_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.assets[] | select(.name | test("mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url')
           curl -sL "$LATEST_URL" | gunzip > mihomo
           chmod +x mihomo
@@ -26,53 +30,41 @@ jobs:
           curl -sL "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" -o anti-ad.mrs
           curl -sL "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" -o adrules.mrs
 
-      - name: 3. 下载并转换 HaGeZi 列表 (含 DGA)
+      - name: 3. 下载并转换 HaGeZi 列表 (含 DGA 高熵域名)
         run: |
-          # 定义列表映射：文件名 -> 下载源片段
           declare -A lists
-          lists=( ["hagezi-tif"]="dns-blocklists@latest/wildcard/tif" ["hagezi-pro"]="dns-blocklists@latest/wildcard/pro.plus" ["hagezi-win"]="dns-blocklists@latest/wildcard/native.winoffice" ["hagezi-gambling"]="dns-blocklists@latest/wildcard/gambling" ["hagezi-dga"]="nrd@latest/domains/dga30" )
+          lists=(
+            ["hagezi-tif"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt"
+            ["hagezi-pro"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.plus-onlydomains.txt"
+            ["hagezi-win"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/native.winoffice-onlydomains.txt"
+            ["hagezi-gambling"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/gambling-onlydomains.txt"
+            ["hagezi-dga"]="https://cdn.jsdelivr.net/gh/hagezi/nrd@latest/domains/dga30.txt"
+          )
 
-          for key in "${!lists[@]}"; do
-            URL_PATH=${lists[$key]}
-            echo "Processing: $key"
-            # 自动判断下载链接类型
-            if [[ $URL_PATH == *"nrd"* ]]; then
-              curl -sL "https://cdn.jsdelivr.net/gh/hagezi/${URL_PATH}.txt" -o raw.txt
-            else
-              curl -sL "https://cdn.jsdelivr.net/gh/hagezi/${URL_PATH}-onlydomains.txt" -o raw.txt
-            fi
+          for name in "${!lists[@]}"; do
+            url="${lists[$name]}"
+            echo "正在处理: $name <- $url"
+            curl -sL "$url" -o raw.txt
             
-            # 核心转换：剔除注释/空行 + 加上 +. 前缀
-            sed -e '/^#/d' -e '/^$/d' -e 's/^/+./' raw.txt > clean.txt
-            ./mihomo convert-ruleset domain text clean.txt "${key}.mrs"
+            # 剔除 # 注释、剔除空行、剔除可能存在的回车符(\r)，并在行首加上 +.
+            sed -e 's/\r$//' -e '/^#/d' -e '/^$/d' -e 's/^/+./' raw.txt > clean.txt
+            
+            ./mihomo convert-ruleset domain text clean.txt "${name}.mrs"
             rm -f raw.txt clean.txt
           done
+          
           rm -f mihomo
 
       - name: 4. 提交更新到仓库
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
-          
-          # 核心修正：强制重置本地状态与远程仓库一致，丢弃任何未追踪的文件或潜在的冲突状态
-          git fetch origin main
-          git reset --hard origin/main
-          
-          # 清理旧文件（确保只保留当前最新生成的）
-          rm -f *.mrs
-          
-          # 重新下载和生成文件... (在这里你的步骤3已经生成了新文件，不需要额外动作)
-          # 注意：为了让这个脚本逻辑完整，我们需要把生成文件的逻辑包含在此步骤前，
-          # 但既然你已经在上一步生成了，这里我们只需要 add 即可
-          
-          # 重新添加所有文件
           git add -A
-          
-          # 检查是否有文件变动
           if ! git diff --quiet --cached; then
-            git commit -m "Auto Update MRS: $(date +'%Y-%m-%d %H:%M:%S')"
-            # 这里的 push --force 是可选项，但通常 reset --hard 后不需要 force
+            git commit -m "Auto Update MRS Rulesets"
+            # 先拉取合并（防止你在网页端刚改了 yml 导致冲突），再推送
+            git pull --rebase origin main
             git push origin main
           else
-            echo "没有文件变动，跳过提交"
+            echo "没有需要更新的内容"
           fi
