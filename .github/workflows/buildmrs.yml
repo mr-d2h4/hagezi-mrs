@@ -2,7 +2,7 @@ name: Build All-in-One MRS
 
 on:
   schedule:
-    - cron: '0 20 * * *' # 每天北京时间凌晨 4:00 自动运行
+    - cron: '0 20 * * *'
   workflow_dispatch:
 
 permissions:
@@ -21,46 +21,41 @@ jobs:
           curl -sL "$LATEST_URL" | gunzip > mihomo
           chmod +x mihomo
 
-      - name: 2. 下载并重命名现有的 MRS (Anti-AD & AdRules)
+      - name: 2. 下载 Anti-AD & AdRules
         run: |
           curl -sL "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" -o anti-ad.mrs
           curl -sL "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" -o adrules.mrs
 
-      - name: 3. 下载并转换 HaGeZi 拦截列表
+      - name: 3. 下载并转换 HaGeZi 列表 (含 DGA)
         run: |
-          # 只保留 4 个核心纯净拦截列表
-          block_lists=("tif" "pro.plus" "native.winoffice" "gambling")
-          
-          for f in "${block_lists[@]}"; do
-            echo "Converting HaGeZi: $f"
-            curl -sL "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/${f}-onlydomains.txt" -o "${f}-raw.txt"
-            # 剔除注释、空行，并在域名前加上 +. 匹配子域名
-            sed -e '/^#/d' -e '/^$/d' -e 's/^/+./' "${f}-raw.txt" > "${f}.txt"
-            ./mihomo convert-ruleset domain text "${f}.txt" "hagezi-${f}.mrs"
-            rm -f "${f}-raw.txt" "${f}.txt"
+          # 定义列表映射：文件名 -> 下载源片段
+          declare -A lists
+          lists=( ["hagezi-tif"]="dns-blocklists@latest/wildcard/tif" ["hagezi-pro"]="dns-blocklists@latest/wildcard/pro.plus" ["hagezi-win"]="dns-blocklists@latest/wildcard/native.winoffice" ["hagezi-gambling"]="dns-blocklists@latest/wildcard/gambling" ["hagezi-dga"]="nrd@latest/domains/dga30" )
+
+          for key in "${!lists[@]}"; do
+            URL_PATH=${lists[$key]}
+            echo "Processing: $key"
+            # 自动判断下载链接类型
+            if [[ $URL_PATH == *"nrd"* ]]; then
+              curl -sL "https://cdn.jsdelivr.net/gh/hagezi/${URL_PATH}.txt" -o raw.txt
+            else
+              curl -sL "https://cdn.jsdelivr.net/gh/hagezi/${URL_PATH}-onlydomains.txt" -o raw.txt
+            fi
+            
+            # 核心转换：剔除注释/空行 + 加上 +. 前缀
+            sed -e '/^#/d' -e '/^$/d' -e 's/^/+./' raw.txt > clean.txt
+            ./mihomo convert-ruleset domain text clean.txt "${key}.mrs"
+            rm -f raw.txt clean.txt
           done
           rm -f mihomo
 
-      - name: 4. 提交更新到仓库
+      - name: 4. 提交更新
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
-          
-          # 1. 同步远程最新状态，解决 push 冲突
           git pull --rebase origin main
-          
-          # 2. 清理掉所有旧的或不需要的文件 (确保生成的只有这几样)
-          # 注意：这里我们强制删除掉之前可能残留的 allow 文件
-          rm -f *spam*.mrs *allow*.mrs
-          git rm -f hagezi-allow.mrs 2>/dev/null || true
-          
-          # 3. 添加变更
           git add -A
-          
-          # 4. 只有在有变动时才提交和推送
           if ! git diff --quiet --cached; then
-            git commit -m "Auto Update MRS Rulesets"
+            git commit -m "Auto Update MRS: Added DGA and HaGeZi"
             git push
-          else
-            echo "没有需要更新的内容"
           fi
