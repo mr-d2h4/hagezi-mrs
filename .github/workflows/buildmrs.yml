@@ -2,7 +2,7 @@ name: Build All-in-One MRS
 
 on:
   schedule:
-    - cron: '0 20 * * *'
+    - cron: '0 20 * * *' # 每天北京时间凌晨 4:00 自动运行
   workflow_dispatch:
 
 permissions:
@@ -21,31 +21,31 @@ jobs:
           curl -sL "$LATEST_URL" | gunzip > mihomo
           chmod +x mihomo
 
-      - name: 2. 下载并保存现有的 MRS
+      - name: 2. 下载并重命名现有的 MRS (Anti-AD & AdRules)
         run: |
-          curl -L "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" -o anti-ad.mrs
-          curl -L "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" -o adrules.mrs
+          curl -sL "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" -o anti-ad.mrs
+          curl -sL "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" -o adrules.mrs
 
-      - name: 3. 下载并转换 HaGeZi 列表
+      - name: 3. 下载并转换 HaGeZi 拦截列表
         run: |
-          # 仅保留：TIF, Pro+, Native, Gambling
+          # 只保留 4 个核心纯净拦截列表
           block_lists=("tif" "pro.plus" "native.winoffice" "gambling")
+          
           for f in "${block_lists[@]}"; do
+            echo "Converting HaGeZi: $f"
             curl -sL "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/${f}-onlydomains.txt" -o "${f}-raw.txt"
+            # 剔除注释、空行，并在域名前加上 +. 匹配子域名
             sed -e '/^#/d' -e '/^$/d' -e 's/^/+./' "${f}-raw.txt" > "${f}.txt"
             ./mihomo convert-ruleset domain text "${f}.txt" "hagezi-${f}.mrs"
-            rm "${f}-raw.txt" "${f}.txt"
+            rm -f "${f}-raw.txt" "${f}.txt"
           done
+          rm -f mihomo
 
-          # 处理放行列表 (保持不变)
-          curl -sL "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/spam-tlds-allow-onlydomains.txt" -o allow-raw.txt
-          sed -e '/^#/d' -e '/^$/d' allow-raw.txt > allow.txt
-          ./mihomo convert-ruleset domain text allow.txt "hagezi-allow.mrs"
-          rm allow-raw.txt allow.txt mihomo
-
-      - name: 4. 提交更新
+      - name: 4. 提交更新到仓库
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
-          git add *.mrs
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto Update MRS" && git push)
+          # 清理之前可能生成的 spam 相关文件（如果有的话）
+          rm -f *spam*.mrs *allow*.mrs
+          git add -A
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto Update MRS Rulesets" && git push)
