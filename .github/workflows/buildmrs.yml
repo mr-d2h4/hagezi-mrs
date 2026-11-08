@@ -2,7 +2,7 @@ name: Build All-in-One MRS
 
 on:
   schedule:
-    - cron: '0 20 * * *' # 每天北京时间凌晨 4:00
+    - cron: '0 20 * * *'
   workflow_dispatch:
 
 permissions:
@@ -15,39 +15,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 1. 下载 Mihomo 内核 (用于转换)
+      - name: 1. 下载 Mihomo 内核
         run: |
           LATEST_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.assets[] | select(.name | test("mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url')
           curl -sL "$LATEST_URL" | gunzip > mihomo
           chmod +x mihomo
 
-      - name: 2. 下载并保存现有的 MRS 文件
+      - name: 2. 下载并保存现有的 MRS
         run: |
-          # 下载 Anti-AD
           curl -L "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" -o anti-ad.mrs
-          # 下载 AdRules
           curl -L "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" -o adrules.mrs
 
       - name: 3. 下载并转换 HaGeZi 列表
         run: |
-          # 建立一个文件清单数组
-          files=("tif" "pro.plus" "spam-tlds" "spam-tlds-allow" "native.winoffice" "gambling")
-          
-          for f in "${files[@]}"; do
-            echo "Processing HaGeZi: $f"
+          # 仅保留：TIF, Pro+, Native, Gambling
+          block_lists=("tif" "pro.plus" "native.winoffice" "gambling")
+          for f in "${block_lists[@]}"; do
             curl -sL "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/${f}-onlydomains.txt" -o "${f}-raw.txt"
-            # 去除注释、空行并添加 +
             sed -e '/^#/d' -e '/^$/d' -e 's/^/+./' "${f}-raw.txt" > "${f}.txt"
-            # 编译
             ./mihomo convert-ruleset domain text "${f}.txt" "hagezi-${f}.mrs"
-            # 清理
             rm "${f}-raw.txt" "${f}.txt"
           done
-          rm mihomo
+
+          # 处理放行列表 (保持不变)
+          curl -sL "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/spam-tlds-allow-onlydomains.txt" -o allow-raw.txt
+          sed -e '/^#/d' -e '/^$/d' allow-raw.txt > allow.txt
+          ./mihomo convert-ruleset domain text allow.txt "hagezi-allow.mrs"
+          rm allow-raw.txt allow.txt mihomo
 
       - name: 4. 提交更新
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
           git add *.mrs
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto Update Rulesets" && git push)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto Update MRS" && git push)
