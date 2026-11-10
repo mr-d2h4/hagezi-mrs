@@ -24,7 +24,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: 0. 变量
@@ -55,15 +55,20 @@ jobs:
       - name: 2. 下载上游现成 MRS
         run: |
           set -euo pipefail
-          mkdir -p publish
+          mkdir -p publish raw
           curl -fsSL --retry 3 --retry-delay 2 -o publish/anti-ad.mrs \
             "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs"
           curl -fsSL --retry 3 --retry-delay 2 -o publish/adrules.mrs \
             "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs"
 
-      - name: 3. HaGeZi 列表转 MRS
+      # 转换规则：删掉 # 开头的行（以及空行），剩下的每一行就是一个域名，
+      # 加 +. 前缀写成 clash ruleset 的 payload 列表。
+      # 生成的 YAML 全部保留在 dist/yaml/ 里，不删、不回读、不覆盖。
+      - name: 3. 生成 YAML（保留）并转换为 MRS
         run: |
           set -euo pipefail
+          mkdir -p dist/yaml publish raw
+
           lists=(
             "hagezi-tif|https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt"
             "hagezi-pro|https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.plus-onlydomains.txt"
@@ -75,49 +80,85 @@ jobs:
           for item in "${lists[@]}"; do
             name="${item%%|*}"
             url="${item#*|}"
+            src="raw/${name}.txt"
+            yml="dist/yaml/${name}.yaml"
+
+            echo "=================================================="
             echo "==> ${name}"
-            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "${url}" -o raw.txt
+            echo "    源: ${url}"
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "${url}" -o "${src}"
 
-            # 去掉 # 开头的行，其余每行就是一个域名，加上 +. 前缀生成规则集 YAML
-            {
-              echo "payload:"
-              awk '!/^#/ { gsub(/\r/, ""); sub(/[ \t]+$/, ""); if ($0 != "") print "  - \047+." $0 "\047" }' raw.txt
-            } > "${name}.yaml"
-            rm -f raw.txt
+            echo "payload:" > "${yml}"
+            sed -e '1s/^\xef\xbb\xbf//' \
+                -e 's/\r$//' \
+                -e 's/^[[:space:]]*//' \
+                -e 's/[[:space:]]*$//' \
+                "${src}" \
+              | grep -v '^#' \
+              | grep -v '^$' \
+              | sed "s|^|  - '+.|; s|\$|'|" \
+              >> "${yml}"
 
-            count=$(grep -c "^  - " "${name}.yaml" || true)
-            [ "${count:-0}" -gt 0 ] || { echo "::error::${name} 没有解析出域名"; exit 1; }
+            src_lines=$(wc -l < "${src}")
+            kept=$(($(wc -l < "${yml}") - 1))
+            echo "    原始 ${src_lines} 行 -> 生成 ${kept} 条规则"
+            [ "${kept}" -gt 0 ] || { echo "::error::${name} 没有解析出任何域名"; exit 1; }
 
-            ./mihomo convert-ruleset domain yaml "${name}.yaml" "publish/${name}.mrs"
+            echo "    ---- ${yml} 前 12 行 ----"
+            head -n 12 "${yml}" | sed 's/^/    /'
+            echo "    ---- ${yml} 后 3 行 ----"
+            tail -n 3 "${yml}" | sed 's/^/    /'
+            echo "    ------------------------------------------"
+
+            ./mihomo convert-ruleset domain yaml "${yml}" "publish/${name}.mrs"
             [ -s "publish/${name}.mrs" ] || { echo "::error::publish/${name}.mrs 生成失败"; exit 1; }
-            echo "OK publish/${name}.mrs  ${count} 条"
-            rm -f "${name}.yaml"
+            echo "    OK publish/${name}.mrs  $(stat -c %s "publish/${name}.mrs") 字节"
           done
 
-      - name: 4. 校验产物
+      # 只做信息性检查：文件非空 + 打印前 16 字节。不做任何"魔数必须等于 XXX"的断言，
+      # 也不阻断构建（上一版把 ASCII "MRS" 当魔数，那是错的）。
+      - name: 4. 列出产物
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(publish/*)
-          [ ${#files[@]} -gt 0 ] || { echo "::error::publish 为空"; exit 1; }
-          for f in "${files[@]}"; do
+
+          echo "=========== publish/ ==========="
+          for f in publish/*; do
             [ -s "$f" ] || { echo "::error file=$f::空文件"; exit 1; }
-            if [ "$(head -c 3 "$f")" = "MRS" ]; then
-              head_ok="MRS头"
-            else
-              head_ok="非MRS头"
-            fi
-            printf '%-24s %10s 字节  %s\n' "$(basename "$f")" "$(stat -c %s "$f")" "${head_ok}"
+            printf '%-22s %12s 字节  head=%s\n' \
+              "$(basename "$f")" "$(stat -c %s "$f")" \
+              "$(head -c 16 "$f" | od -An -tx1 | tr -d ' \n')"
           done
+
+          echo "=========== dist/yaml/ ==========="
+          for f in dist/yaml/*.yaml; do
+            printf '%-22s %12s 字节  %8s 条规则\n' \
+              "$(basename "$f")" "$(stat -c %s "$f")" "$(($(wc -l < "$f") - 1))"
+          done
+
           rm -f mihomo
 
-      - name: 5. 发布 Release 并推送 release 分支
+      # 中间产物 YAML 和最终 MRS 都上传，可下载后逐行比对
+      - name: 5. 上传产物（含中间 YAML）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mrs-build-${{ env.TAG_NAME }}
+          path: |
+            dist/yaml/*.yaml
+            publish/*.mrs
+            raw/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 6. 发布 Release 并推送 release 分支
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           files=(publish/*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::publish 为空"; exit 1; }
 
           if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release upload "${TAG_NAME}" "${files[@]}" --repo "${GITHUB_REPOSITORY}" --clobber
@@ -129,7 +170,6 @@ jobs:
               --latest
           fi
 
-          # 只保留最近 10 个 Release（失败不影响构建）
           { gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName --jq '.[].tagName' \
               | tail -n +11 \
               | while read -r t; do gh release delete "$t" --repo "${GITHUB_REPOSITORY}" -y --cleanup-tag || true; done
@@ -144,7 +184,7 @@ jobs:
           git commit -q -m "${RELEASE_NAME}"
           git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${RELEASE_BRANCH}"
 
-      - name: 6. 刷新 jsDelivr 缓存
+      - name: 7. 刷新 jsDelivr 缓存
         run: |
           set -uo pipefail
           cd publish
