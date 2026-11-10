@@ -2,8 +2,13 @@ name: Build All-in-One MRS
 
 on:
   schedule:
-    - cron: '0 20 * * *' # 每天北京时间 04:00 自动运行（UTC 20:00）
+    - cron: '0 20 * * *' # UTC 20:00 = 北京时间 04:00
   workflow_dispatch:
+  push:
+    branches-ignore:
+      - release
+    paths-ignore:
+      - '**/README.md'
 
 permissions:
   contents: write
@@ -14,181 +19,138 @@ concurrency:
 
 env:
   MIHOMO_REPO: MetaCubeX/mihomo
+  RELEASE_BRANCH: release
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
+      - name: 0. 变量
+        run: |
+          set -euo pipefail
+          echo "RELEASE_NAME=Released on $(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: 1. 清理旧文件并下载 Mihomo 内核
+      - name: 1. 下载 Mihomo 内核
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL=$(curl -fsSL --retry 3 --retry-delay 2 \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${MIHOMO_REPO}/releases/latest" \
+                | jq -r '[.assets[]? | select(.name | test("^mihomo-linux-amd64-compatible-.*\\.gz$")) | .browser_download_url][0] // empty')
+          [ -n "${URL}" ] || { echo "::error::获取内核地址失败"; exit 1; }
+          echo "内核: ${URL}"
+          curl -fsSL --retry 3 --retry-delay 2 "${URL}" | gunzip > mihomo
+          chmod +x mihomo
+          ./mihomo -v
+
+      - name: 2. 下载上游现成 MRS
+        run: |
+          set -euo pipefail
+          mkdir -p publish
+          curl -fsSL --retry 3 --retry-delay 2 -o publish/anti-ad.mrs \
+            "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs"
+          curl -fsSL --retry 3 --retry-delay 2 -o publish/adrules.mrs \
+            "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs"
+
+      - name: 3. HaGeZi 列表转 MRS
+        run: |
+          set -euo pipefail
+          lists=(
+            "hagezi-tif|https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt"
+            "hagezi-pro|https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.plus-onlydomains.txt"
+            "hagezi-win|https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/native.winoffice-onlydomains.txt"
+            "hagezi-gambling|https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/gambling-onlydomains.txt"
+            "hagezi-dga|https://cdn.jsdelivr.net/gh/hagezi/nrd@latest/domains/dga30.txt"
+          )
+
+          for item in "${lists[@]}"; do
+            name="${item%%|*}"
+            url="${item#*|}"
+            echo "==> ${name}"
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "${url}" -o raw.txt
+
+            # 去掉 # 开头的行，其余每行就是一个域名，加上 +. 前缀生成规则集 YAML
+            {
+              echo "payload:"
+              awk '!/^#/ { gsub(/\r/, ""); sub(/[ \t]+$/, ""); if ($0 != "") print "  - \047+." $0 "\047" }' raw.txt
+            } > "${name}.yaml"
+            rm -f raw.txt
+
+            count=$(grep -c "^  - " "${name}.yaml" || true)
+            [ "${count:-0}" -gt 0 ] || { echo "::error::${name} 没有解析出域名"; exit 1; }
+
+            ./mihomo convert-ruleset domain yaml "${name}.yaml" "publish/${name}.mrs"
+            [ -s "publish/${name}.mrs" ] || { echo "::error::publish/${name}.mrs 生成失败"; exit 1; }
+            echo "OK publish/${name}.mrs  ${count} 条"
+            rm -f "${name}.yaml"
+          done
+
+      - name: 4. 校验产物
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(publish/*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::publish 为空"; exit 1; }
+          for f in "${files[@]}"; do
+            [ -s "$f" ] || { echo "::error file=$f::空文件"; exit 1; }
+            if [ "$(head -c 3 "$f")" = "MRS" ]; then
+              head_ok="MRS头"
+            else
+              head_ok="非MRS头"
+            fi
+            printf '%-24s %10s 字节  %s\n' "$(basename "$f")" "$(stat -c %s "$f")" "${head_ok}"
+          done
+          rm -f mihomo
+
+      - name: 5. 发布 Release 并推送 release 分支
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           shopt -s nullglob
+          files=(publish/*)
 
-          # 先删掉仓库里所有旧的 .mrs 和 source 中间产物
-          rm -f ./*.mrs
-          rm -rf source
-          mkdir -p source
-
-          # 下载最新内核（带 Token 请求 API，避免匿名调用被限流）
-          LATEST_URL=$(curl -fsSL --retry 3 --retry-delay 2 \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${MIHOMO_REPO}/releases/latest" \
-            | jq -r '[.assets[] | select(.name | test("^mihomo-linux-amd64-compatible-v[0-9].*\\.gz$")) | .browser_download_url][0] // empty')
-
-          if [ -z "${LATEST_URL}" ]; then
-            echo "::error::未能获取 Mihomo 内核下载地址"
-            exit 1
-          fi
-          echo "内核地址: ${LATEST_URL}"
-
-          curl -fsSL --retry 3 --retry-delay 2 "${LATEST_URL}" | gunzip > mihomo
-          chmod +x mihomo
-          ./mihomo -v
-
-      - name: 2. 下载 Anti-AD & AdRules
-        run: |
-          set -euo pipefail
-
-          curl -fsSL --retry 3 --retry-delay 2 \
-            "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" \
-            -o anti-ad.mrs
-
-          curl -fsSL --retry 3 --retry-delay 2 \
-            "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" \
-            -o adrules.mrs
-
-          for f in anti-ad.mrs adrules.mrs; do
-            if [ ! -s "$f" ]; then
-              echo "::error::$f 下载失败或内容为空"
-              exit 1
-            fi
-            echo "✔ $f 下载成功 ($(stat -c %s "$f") bytes)"
-          done
-
-      - name: 3. 下载并转换 HaGeZi 列表到 source/ 下的 YAML
-        env:
-          # 清洗脚本放在 env 里，YAML 会自动去掉公共缩进，Python 缩进不会被破坏
-          NORMALIZE_PY: |
-            import codecs, sys
-            raw = open(sys.argv[1], 'rb').read()
-            if raw[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
-                text = raw.decode('utf-16')
-            else:
-                try:
-                    text = raw.decode('utf-8-sig')
-                except UnicodeDecodeError:
-                    text = raw.decode('gb18030')
-            out = []
-            for line in text.splitlines():
-                line = line.strip()
-                if not line or line.startswith('#') or line.startswith('!'):
-                    continue
-                line = line.removeprefix('||').removesuffix('^').strip('.')
-                if line:
-                    out.append('+.' + line)
-            if not out:
-                sys.exit('清洗后为空: ' + sys.argv[1])
-            with open(sys.argv[2], 'w', encoding='utf-8', newline='\n') as fp:
-                fp.write('\n'.join(out) + '\n')
-        run: |
-          set -euo pipefail
-
-          declare -A lists
-          lists=(
-            ["hagezi-tif"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt"
-            ["hagezi-pro"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.plus-onlydomains.txt"
-            ["hagezi-win"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/native.winoffice-onlydomains.txt"
-            ["hagezi-gambling"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/gambling-onlydomains.txt"
-            ["hagezi-dga"]="https://cdn.jsdelivr.net/gh/hagezi/nrd@latest/domains/dga30.txt"
-          )
-
-          for name in "${!lists[@]}"; do
-            url="${lists[$name]}"
-            echo "正在处理: ${name} <- ${url}"
-            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "$url" -o raw.txt
-
-            # 编码归一(UTF-8) + 剔除注释/空行 + 加 +. 前缀
-            python3 -c "$NORMALIZE_PY" raw.txt clean.txt
-            rm -f raw.txt
-
-            ./mihomo convert-ruleset domain text clean.txt "source/${name}.yaml"
-            rm -f clean.txt
-            echo "✔ source/${name}.yaml 生成成功"
-          done
-
-      - name: 4. 校验 YAML 语法并转换为 MRS
-        run: |
-          set -euo pipefail
-
-          python3 -c "import yaml" 2>/dev/null || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq python3-yaml
-          }
-
-          shopt -s nullglob
-          files=(source/*.yaml)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::source 目录为空，没有可转换的 YAML"
-            exit 1
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${files[@]}" --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${TAG_NAME}" "${files[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${RELEASE_NAME}" \
+              --notes "自动构建于 $(date -u '+%F %T UTC')" \
+              --latest
           fi
 
-          for f in "${files[@]}"; do
-            rule_name=$(basename "$f" .yaml)
-            if [ ! -s "$f" ]; then
-              echo "::error file=$f::文件为空"
-              exit 1
-            fi
-            if ! python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1], encoding='utf-8'))" "$f"; then
-              echo "::error file=$f::YAML 校验失败"
-              exit 1
-            fi
-            ./mihomo convert-ruleset domain yaml "$f" "${rule_name}.mrs"
-            if [ ! -s "${rule_name}.mrs" ]; then
-              echo "::error::${rule_name}.mrs 生成失败"
-              exit 1
-            fi
-            echo "✔ ${rule_name}.mrs 生成成功"
-          done
+          # 只保留最近 10 个 Release（失败不影响构建）
+          { gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName --jq '.[].tagName' \
+              | tail -n +11 \
+              | while read -r t; do gh release delete "$t" --repo "${GITHUB_REPOSITORY}" -y --cleanup-tag || true; done
+          } || echo "::warning::清理旧 Release 失败"
 
-          rm -f mihomo
-
-      - name: 5. 提交更新到仓库
-        run: |
-          set -euo pipefail
-
-          # 中间产物不入库
-          rm -rf source
-          rm -f mihomo
-
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Actions"
-
-          BRANCH="${GITHUB_REF_NAME:-main}"
-
+          cd publish
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b "${RELEASE_BRANCH}"
           git add -A
-          if git diff --quiet --cached; then
-            echo "没有需要更新的内容"
-            exit 0
-          fi
-          git commit -m "Auto Update MRS Rulesets"
+          git commit -q -m "${RELEASE_NAME}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${RELEASE_BRANCH}"
 
-          for i in 1 2 3; do
-            if git push origin "HEAD:${BRANCH}"; then
-              echo "推送成功"
-              exit 0
-            fi
-            echo "第 ${i} 次推送失败，同步远端后重试..."
-            git pull --rebase --autostash origin "${BRANCH}" || true
-            sleep 5
+      - name: 6. 刷新 jsDelivr 缓存
+        run: |
+          set -uo pipefail
+          cd publish
+          for f in *.mrs; do
+            echo "purge ${f}"
+            curl -fsSL --max-time 60 \
+              "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@${RELEASE_BRANCH}/${f}" >/dev/null \
+              || echo "::warning::purge 失败: ${f}"
           done
-
-          echo "::error::推送失败，请检查远端分支是否受保护"
-          exit 1
