@@ -48,12 +48,26 @@ jobs:
             echo "正在处理: $name <- $url"
             curl -sL "$url" -o raw.txt
 
-            # 剔除 # 注释、剔除空行、剔除可能存在的回车符(\r)，并在行首加上 +.
-            sed -e 's/\r$//' -e '/^#/d' -e '/^$/d' -e 's/^/+./' raw.txt > clean.txt
+            # 编码归一(UTF-8) + 剔除注释/空行 + 加 +. 前缀
+            # 多编码尝试，避免原始列表混入 GBK/UTF-16 等字节导致后续 YAML 非法
+            python3 -c "
+import sys
+raw = open('raw.txt', 'rb').read()
+text = None
+for enc in ('utf-8-sig', 'utf-8', 'gb18030', 'utf-16'):
+    try:
+        text = raw.decode(enc); break
+    except UnicodeDecodeError:
+        pass
+if text is None:
+    sys.exit('无法识别编码: raw.txt')
+out = ['+.' + l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith('#')]
+open('clean.txt', 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+"
+            rm -f raw.txt
 
-            # txt -> YAML 中间产物，落盘到 source/
             ./mihomo convert-ruleset domain text clean.txt "source/${name}.yaml"
-            rm -f raw.txt clean.txt
+            rm -f clean.txt
           done
 
       - name: 4. 校验 YAML 语法并转换为 MRS
@@ -69,11 +83,10 @@ jobs:
 
           for f in "${files[@]}"; do
             name=$(basename "$f" .yaml)
-            if [ ! -s "$f" ] || ! python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$f"; then
+            if [ ! -s "$f" ] || ! python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1], encoding='utf-8'))" "$f"; then
               echo "::error file=$f::YAML 校验失败"
               exit 1
             fi
-
             ./mihomo convert-ruleset domain yaml "$f" "${name}.mrs"
             echo "✔ ${name}.mrs 生成成功"
           done
