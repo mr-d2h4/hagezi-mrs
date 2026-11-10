@@ -17,9 +17,11 @@ jobs:
 
       - name: 1. 清理旧文件并下载 Mihomo 内核
         run: |
-          # 先删掉仓库里所有旧的 .mrs 文件（包括残留的 allow 或 spam）
+          # 先删掉仓库里所有旧的 .mrs 和 source 中间产物
           rm -f *.mrs
-          
+          rm -rf source
+          mkdir -p source
+
           # 下载最新内核
           LATEST_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.assets[] | select(.name | test("mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url')
           curl -sL "$LATEST_URL" | gunzip > mihomo
@@ -30,7 +32,7 @@ jobs:
           curl -sL "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" -o anti-ad.mrs
           curl -sL "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" -o adrules.mrs
 
-      - name: 3. 下载并转换 HaGeZi 列表 (含 DGA 高熵域名)
+      - name: 3. 下载并转换 HaGeZi 列表到 source/ 下的 YAML
         run: |
           declare -A lists
           lists=(
@@ -45,17 +47,40 @@ jobs:
             url="${lists[$name]}"
             echo "正在处理: $name <- $url"
             curl -sL "$url" -o raw.txt
-            
+
             # 剔除 # 注释、剔除空行、剔除可能存在的回车符(\r)，并在行首加上 +.
             sed -e 's/\r$//' -e '/^#/d' -e '/^$/d' -e 's/^/+./' raw.txt > clean.txt
-            
-            ./mihomo convert-ruleset domain text clean.txt "${name}.mrs"
+
+            # txt -> YAML 中间产物，落盘到 source/
+            ./mihomo convert-ruleset domain text clean.txt "source/${name}.yaml"
             rm -f raw.txt clean.txt
           done
-          
+
+      - name: 4. 校验 YAML 语法并转换为 MRS
+        run: |
+          python3 -c "import yaml" 2>/dev/null || sudo apt-get install -y -qq python3-yaml
+
+          shopt -s nullglob
+          files=(source/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::source 目录为空，没有可转换的 YAML"
+            exit 1
+          fi
+
+          for f in "${files[@]}"; do
+            name=$(basename "$f" .yaml)
+            if [ ! -s "$f" ] || ! python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$f"; then
+              echo "::error file=$f::YAML 校验失败"
+              exit 1
+            fi
+
+            ./mihomo convert-ruleset domain yaml "$f" "${name}.mrs"
+            echo "✔ ${name}.mrs 生成成功"
+          done
+
           rm -f mihomo
 
-      - name: 4. 提交更新到仓库
+      - name: 5. 提交更新到仓库
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
