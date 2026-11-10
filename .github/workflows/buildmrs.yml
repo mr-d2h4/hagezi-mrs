@@ -2,11 +2,18 @@ name: Build All-in-One MRS
 
 on:
   schedule:
-    - cron: '0 20 * * *' # 每天北京时间凌晨 4:00 自动运行
+    - cron: '0 20 * * *' # 每天北京时间 04:00 自动运行（UTC 20:00）
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-all-in-one-mrs
+  cancel-in-progress: false
+
+env:
+  MIHOMO_REPO: MetaCubeX/mihomo
 
 jobs:
   build:
@@ -14,26 +21,86 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 1. 清理旧文件并下载 Mihomo 内核
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          shopt -s nullglob
+
           # 先删掉仓库里所有旧的 .mrs 和 source 中间产物
-          rm -f *.mrs
+          rm -f ./*.mrs
           rm -rf source
           mkdir -p source
 
-          # 下载最新内核
-          LATEST_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.assets[] | select(.name | test("mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url')
-          curl -sL "$LATEST_URL" | gunzip > mihomo
+          # 下载最新内核（带 Token 请求 API，避免匿名调用被限流）
+          LATEST_URL=$(curl -fsSL --retry 3 --retry-delay 2 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${MIHOMO_REPO}/releases/latest" \
+            | jq -r '[.assets[] | select(.name | test("^mihomo-linux-amd64-compatible-v[0-9].*\\.gz$")) | .browser_download_url][0] // empty')
+
+          if [ -z "${LATEST_URL}" ]; then
+            echo "::error::未能获取 Mihomo 内核下载地址"
+            exit 1
+          fi
+          echo "内核地址: ${LATEST_URL}"
+
+          curl -fsSL --retry 3 --retry-delay 2 "${LATEST_URL}" | gunzip > mihomo
           chmod +x mihomo
+          ./mihomo -v
 
       - name: 2. 下载 Anti-AD & AdRules
         run: |
-          curl -sL "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" -o anti-ad.mrs
-          curl -sL "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" -o adrules.mrs
+          set -euo pipefail
+
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs" \
+            -o anti-ad.mrs
+
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules-mihomo.mrs" \
+            -o adrules.mrs
+
+          for f in anti-ad.mrs adrules.mrs; do
+            if [ ! -s "$f" ]; then
+              echo "::error::$f 下载失败或内容为空"
+              exit 1
+            fi
+            echo "✔ $f 下载成功 ($(stat -c %s "$f") bytes)"
+          done
 
       - name: 3. 下载并转换 HaGeZi 列表到 source/ 下的 YAML
+        env:
+          # 清洗脚本放在 env 里，YAML 会自动去掉公共缩进，Python 缩进不会被破坏
+          NORMALIZE_PY: |
+            import codecs, sys
+            raw = open(sys.argv[1], 'rb').read()
+            if raw[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+                text = raw.decode('utf-16')
+            else:
+                try:
+                    text = raw.decode('utf-8-sig')
+                except UnicodeDecodeError:
+                    text = raw.decode('gb18030')
+            out = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith('#') or line.startswith('!'):
+                    continue
+                line = line.removeprefix('||').removesuffix('^').strip('.')
+                if line:
+                    out.append('+.' + line)
+            if not out:
+                sys.exit('清洗后为空: ' + sys.argv[1])
+            with open(sys.argv[2], 'w', encoding='utf-8', newline='\n') as fp:
+                fp.write('\n'.join(out) + '\n')
         run: |
+          set -euo pipefail
+
           declare -A lists
           lists=(
             ["hagezi-tif"]="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/tif-onlydomains.txt"
@@ -45,34 +112,26 @@ jobs:
 
           for name in "${!lists[@]}"; do
             url="${lists[$name]}"
-            echo "正在处理: $name <- $url"
-            curl -sL "$url" -o raw.txt
+            echo "正在处理: ${name} <- ${url}"
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 "$url" -o raw.txt
 
             # 编码归一(UTF-8) + 剔除注释/空行 + 加 +. 前缀
-            # 多编码尝试，避免原始列表混入 GBK/UTF-16 等字节导致后续 YAML 非法
-            python3 -c "
-import sys
-raw = open('raw.txt', 'rb').read()
-text = None
-for enc in ('utf-8-sig', 'utf-8', 'gb18030', 'utf-16'):
-    try:
-        text = raw.decode(enc); break
-    except UnicodeDecodeError:
-        pass
-if text is None:
-    sys.exit('无法识别编码: raw.txt')
-out = ['+.' + l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith('#')]
-open('clean.txt', 'w', encoding='utf-8').write('\n'.join(out) + '\n')
-"
+            python3 -c "$NORMALIZE_PY" raw.txt clean.txt
             rm -f raw.txt
 
             ./mihomo convert-ruleset domain text clean.txt "source/${name}.yaml"
             rm -f clean.txt
+            echo "✔ source/${name}.yaml 生成成功"
           done
 
       - name: 4. 校验 YAML 语法并转换为 MRS
         run: |
-          python3 -c "import yaml" 2>/dev/null || sudo apt-get install -y -qq python3-yaml
+          set -euo pipefail
+
+          python3 -c "import yaml" 2>/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-yaml
+          }
 
           shopt -s nullglob
           files=(source/*.yaml)
@@ -82,27 +141,54 @@ open('clean.txt', 'w', encoding='utf-8').write('\n'.join(out) + '\n')
           fi
 
           for f in "${files[@]}"; do
-            name=$(basename "$f" .yaml)
-            if [ ! -s "$f" ] || ! python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1], encoding='utf-8'))" "$f"; then
+            rule_name=$(basename "$f" .yaml)
+            if [ ! -s "$f" ]; then
+              echo "::error file=$f::文件为空"
+              exit 1
+            fi
+            if ! python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1], encoding='utf-8'))" "$f"; then
               echo "::error file=$f::YAML 校验失败"
               exit 1
             fi
-            ./mihomo convert-ruleset domain yaml "$f" "${name}.mrs"
-            echo "✔ ${name}.mrs 生成成功"
+            ./mihomo convert-ruleset domain yaml "$f" "${rule_name}.mrs"
+            if [ ! -s "${rule_name}.mrs" ]; then
+              echo "::error::${rule_name}.mrs 生成失败"
+              exit 1
+            fi
+            echo "✔ ${rule_name}.mrs 生成成功"
           done
 
           rm -f mihomo
 
       - name: 5. 提交更新到仓库
         run: |
+          set -euo pipefail
+
+          # 中间产物不入库
+          rm -rf source
+          rm -f mihomo
+
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
+
+          BRANCH="${GITHUB_REF_NAME:-main}"
+
           git add -A
-          if ! git diff --quiet --cached; then
-            git commit -m "Auto Update MRS Rulesets"
-            # 先拉取合并（防止你在网页端刚改了 yml 导致冲突），再推送
-            git pull --rebase origin main
-            git push origin main
-          else
+          if git diff --quiet --cached; then
             echo "没有需要更新的内容"
+            exit 0
           fi
+          git commit -m "Auto Update MRS Rulesets"
+
+          for i in 1 2 3; do
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "推送成功"
+              exit 0
+            fi
+            echo "第 ${i} 次推送失败，同步远端后重试..."
+            git pull --rebase --autostash origin "${BRANCH}" || true
+            sleep 5
+          done
+
+          echo "::error::推送失败，请检查远端分支是否受保护"
+          exit 1
