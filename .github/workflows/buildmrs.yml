@@ -34,7 +34,7 @@ jobs:
           echo "TAG_NAME=$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 1. 下载 Mihomo 内核
         env:
@@ -55,7 +55,7 @@ jobs:
       - name: 2. 下载上游现成 MRS
         run: |
           set -euo pipefail
-          mkdir -p publish raw
+          mkdir -p publish raw dist/yaml
           curl -fsSL --retry 3 --retry-delay 2 -o publish/anti-ad.mrs \
             "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad.github.io/master/docs/mihomo.mrs"
           curl -fsSL --retry 3 --retry-delay 2 -o publish/adrules.mrs \
@@ -115,8 +115,7 @@ jobs:
             echo "    OK publish/${name}.mrs  $(stat -c %s "publish/${name}.mrs") 字节"
           done
 
-      # 只做信息性检查：文件非空 + 打印前 16 字节。不做任何"魔数必须等于 XXX"的断言，
-      # 也不阻断构建（上一版把 ASCII "MRS" 当魔数，那是错的）。
+      # 只做信息性检查：文件非空 + 打印前 16 字节，不做任何魔数断言、不阻断构建
       - name: 4. 列出产物
         run: |
           set -euo pipefail
@@ -141,7 +140,7 @@ jobs:
       # 中间产物 YAML 和最终 MRS 都上传，可下载后逐行比对
       - name: 5. 上传产物（含中间 YAML）
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: mrs-build-${{ env.TAG_NAME }}
           path: |
